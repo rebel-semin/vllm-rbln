@@ -389,6 +389,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
+        self.prompt_token_arrays: dict[str, tuple[list[int], np.ndarray]] = {}
         self.num_prompt_logprobs: dict[str, int] = {}
 
         # Input Batch
@@ -616,6 +617,7 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self.prompt_token_arrays.pop(req_id, None)
 
         # Remove the finished requests from the persistent batch.
         for req_id in scheduler_output.finished_req_ids:
@@ -801,7 +803,24 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 sampling_params := request.sampling_params
             ):
                 sampling_params.top_p = min(sampling_params.top_p, TOP_P_CLAMP)
+            # A prefill-only step evicts every decode request, so each one is re-added
+            # here once per prefill, and converting the prompt list is most of
+            # add_request. Fill the row from an array made once per prompt list, and
+            # give logits processors back the list.
+            prompt = request.prompt_token_ids
+            if prompt is not None:
+                cached = self.prompt_token_arrays.get(request.req_id)
+                if cached is None or cached[0] is not prompt:
+                    cached = (prompt, np.asarray(prompt, dtype=np.int32))
+                    self.prompt_token_arrays[request.req_id] = cached
+                request.prompt_token_ids = cached[1]
             self.input_batch.add_request(request)
+            if prompt is not None:
+                request.prompt_token_ids = prompt
+                if request.sampling_params:
+                    added = self.input_batch.batch_update_builder.added
+                    index, params, _, output_token_ids = added[-1]
+                    added[-1] = (index, params, prompt, output_token_ids)
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
 
         # Condense the batched states if there are gaps left by removed requests

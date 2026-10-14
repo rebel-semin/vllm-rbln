@@ -110,6 +110,51 @@ class TestBlockTableMaintenance:
             assert block_table_matches_state(runner, req_id)
 
 
+class TestPromptRowReAdd:
+    def test_re_add_fills_the_row_from_the_first_prompt_array(
+        self, make_model_runner, monkeypatch
+    ):
+        # A decode evicted by a prefill-only step is re-added from the array made
+        # on its first add; logits processors still see the prompt list.
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner._update_states(schedule_new("a"))
+        prompt = runner.requests["a"].prompt_token_ids
+        array = runner.prompt_token_arrays["a"][1]
+        runner._update_states(make_scheduler_output(num_scheduled_tokens={}))
+        assert not is_in_batch(runner, "a")
+
+        seen: list[list[int] | None] = []
+        refresh = runner.input_batch.refresh_metadata
+
+        def record_added():
+            seen.extend(
+                added[2] for added in runner.input_batch.batch_update_builder.added
+            )
+            refresh()
+
+        monkeypatch.setattr(runner.input_batch, "refresh_metadata", record_added)
+        runner._update_states(schedule_cached(req_ids=["a"], num_computed_tokens=[3]))
+
+        assert runner.prompt_token_arrays["a"][1] is array
+        assert runner.requests["a"].prompt_token_ids is prompt
+        assert seen == [prompt]
+        req_index = runner.input_batch.req_id_to_index["a"]
+        assert (
+            runner.input_batch.token_ids_cpu[req_index, : len(prompt)].tolist()
+            == prompt
+        )
+
+    def test_finished_request_drops_its_prompt_array(
+        self, make_model_runner, monkeypatch
+    ):
+        _last_rank(monkeypatch)
+        runner = make_model_runner()
+        runner._update_states(schedule_new("a"))
+        runner._update_states(make_scheduler_output(finished_req_ids={"a"}))
+        assert "a" not in runner.prompt_token_arrays
+
+
 class TestOutputTokenAlignment:
     def test_discarded_output_tokens_are_truncated(
         self, make_model_runner, monkeypatch
