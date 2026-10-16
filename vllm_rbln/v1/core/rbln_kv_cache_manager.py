@@ -464,6 +464,26 @@ class RBLNKVCacheManager(KVCacheManager):
 
         return match
 
+    def sub_block_source_blocks(
+        self, request: Request, num_computed_tokens: int
+    ) -> list[KVCacheBlock]:
+        """Source blocks a sub-block match for ``request`` would copy from.
+
+        Read-only counterpart of ``get_computed_blocks_sub_block``: takes no
+        references, so the blocks stay where they are in the free queue.
+        """
+        sub_hashes = self._get_or_compute_sub_hashes(request).hashes
+        blocks = []
+        for gi in self._group_infos:
+            start = (num_computed_tokens // gi.block_size) * gi.sub_blocks_per_block
+            query = sub_hashes[start : start + gi.sub_blocks_per_block - 1]
+            if not query:
+                continue
+            src_block_id, num_matched = gi.sub_block_index.longest_match(query)
+            if src_block_id is not None and num_matched:
+                blocks.append(self.block_pool.blocks[src_block_id])
+        return blocks
+
     def apply_sub_block_match(self, match: SubBlockMatch) -> None:
         """Create copy ops from a sub-block match.
 

@@ -67,6 +67,9 @@ if TYPE_CHECKING:
     # --- MODEL INPUT / SCHEDULING ---
     VLLM_RBLN_SUB_BLOCK_CACHE: bool = True
     VLLM_RBLN_SUB_BLOCK_SIZE: int | None = None
+    VLLM_RBLN_CACHE_AWARE_ADMISSION_WINDOW: int = 0
+    VLLM_RBLN_CACHE_AWARE_ADMISSION_THRESHOLD: float = 0.5
+    VLLM_RBLN_WAITING_PREFIX_REFRESH: bool = False
     # --- MOE ---
     VLLM_RBLN_SPECIALIZE_MOE_DECODE: bool = True
     VLLM_RBLN_USE_MOE_TOKENS_MASK: bool = True
@@ -331,6 +334,24 @@ environment_variables = {
     "VLLM_RBLN_SUB_BLOCK_SIZE": lambda: (
         int(size) if (size := os.environ.get("VLLM_RBLN_SUB_BLOCK_SIZE")) else None
     ),
+    # Look-ahead depth for cache-aware admission (vllm-project/vllm#54625):
+    # the first N waiting requests are admitted deepest locally cached prefix
+    # first. 0 keeps arrival order.
+    "VLLM_RBLN_CACHE_AWARE_ADMISSION_WINDOW": lambda: int(
+        os.environ.get("VLLM_RBLN_CACHE_AWARE_ADMISSION_WINDOW", 0)
+    ),
+    # KV cache usage below which cache-aware admission keeps arrival order.
+    "VLLM_RBLN_CACHE_AWARE_ADMISSION_THRESHOLD": lambda: float(
+        os.environ.get("VLLM_RBLN_CACHE_AWARE_ADMISSION_THRESHOLD", 0.5)
+    ),
+    # Keep waiting requests' resident prefix blocks at the MRU end of the free
+    # queue so they are evicted last (sgl-project/sglang#41593).
+    "VLLM_RBLN_WAITING_PREFIX_REFRESH": (
+        lambda: (
+            os.environ.get("VLLM_RBLN_WAITING_PREFIX_REFRESH", "False").lower()
+            in ("true", "1")
+        )
+    ),
     # --- MOE ---
     # If true, it specializes the cases where all instances are at decode stage
     "VLLM_RBLN_SPECIALIZE_MOE_DECODE": (
@@ -415,6 +436,9 @@ RBLN_NON_COMPILE_ENV = frozenset(
         "VLLM_RBLN_AUTO_PORT",
         "VLLM_RBLN_SUB_BLOCK_CACHE",
         "VLLM_RBLN_SUB_BLOCK_SIZE",
+        "VLLM_RBLN_CACHE_AWARE_ADMISSION_WINDOW",
+        "VLLM_RBLN_CACHE_AWARE_ADMISSION_THRESHOLD",
+        "VLLM_RBLN_WAITING_PREFIX_REFRESH",
         # RBLNConfig fields: the config hash keys the bundle on these
         "VLLM_RBLN_NUM_DEVICES_PER_LOCAL_RANK",
         "VLLM_RBLN_ENFORCE_MODEL_FP32",

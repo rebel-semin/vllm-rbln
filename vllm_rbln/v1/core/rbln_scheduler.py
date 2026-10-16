@@ -36,6 +36,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
 
+import vllm_rbln.envs as envs
 from vllm_rbln.config import RBLNConfig
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.core.rbln_kv_cache_manager import (
@@ -52,6 +53,11 @@ from vllm_rbln.v1.core.utils import (
 )
 
 logger = init_logger(__name__)
+
+# sgl-project/sglang#41593: WAITING_QUEUE_PREFIX_MATCH_MAX and
+# WAITING_PREFIX_REFRESH_INTERVAL_S.
+_WAITING_PREFIX_REFRESH_MAX = 128
+_WAITING_PREFIX_REFRESH_INTERVAL_S = 0.5
 
 
 @dataclass
@@ -128,6 +134,18 @@ class RBLNScheduler(Scheduler):
         # ceil(demand / pp) to spread decodes across microbatches. pp == 1 makes
         # the soft cap a no-op. See v1/core/utils.py.
         self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
+
+        prefix_caching = self.cache_config.enable_prefix_caching
+        self.cache_aware_window = (
+            envs.VLLM_RBLN_CACHE_AWARE_ADMISSION_WINDOW
+            if prefix_caching and self.policy == SchedulingPolicy.FCFS
+            else 0
+        )
+        self.cache_aware_threshold = envs.VLLM_RBLN_CACHE_AWARE_ADMISSION_THRESHOLD
+        self.refresh_waiting_prefixes = (
+            prefix_caching and envs.VLLM_RBLN_WAITING_PREFIX_REFRESH
+        )
+        self._last_waiting_prefix_refresh = float("-inf")
 
     def _decode_demand(self) -> int:
         """Total decode demand for this step's soft (ceil(demand/pp)) cap.
@@ -451,6 +469,15 @@ class RBLNScheduler(Scheduler):
                 if req.lora_request and req.lora_request.lora_int_id > 0
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
+
+        if (
+            self.cache_aware_window
+            and not preempted_reqs
+            and self._pause_state == PauseState.UNPAUSED
+        ):
+            self._reorder_waiting_by_cached_prefix()
+        if self.refresh_waiting_prefixes:
+            self._touch_waiting_prefixes()
 
         # Next, schedule the WAITING requests.
         # NOTE(RBLN): We do not attempt to schedule a new prefill request when a running
@@ -1139,6 +1166,90 @@ class RBLNScheduler(Scheduler):
         if match is not None:
             self.kv_cache_manager.release_sub_block_match(match)
         return None, 0
+
+    def _reorder_waiting_by_cached_prefix(self) -> None:
+        """Admit waiting requests with a resident prefix ahead of cold ones.
+
+        Port of vllm-project/vllm#54625. Once KV usage reaches the threshold,
+        the never-scheduled requests among the first ``cache_aware_window``
+        are reordered by locally cached tokens (full blocks), deepest first,
+        arrival order on ties. Every other request keeps its slot.
+        """
+        if (
+            len(self.waiting) < 2
+            or self.kv_cache_manager.usage < self.cache_aware_threshold
+        ):
+            return
+        head = list(itertools.islice(self.waiting, self.cache_aware_window))
+        slots = [
+            i
+            for i, request in enumerate(head)
+            if request.status == RequestStatus.WAITING
+            and not request.num_computed_tokens
+        ]
+        if len(slots) < 2:
+            return
+        cached = {}
+        for i in slots:
+            request = head[i]
+            cached[i] = 0
+            if self.kv_cache_manager.prefix_cache_lookup_enabled(request):
+                # The last token is always recomputed, as in get_computed_blocks.
+                _, cached[i], _ = (
+                    self.kv_cache_manager.coordinator.find_longest_cache_hit(
+                        request.block_hashes, request.num_tokens - 1
+                    )
+                )
+        order = sorted(slots, key=lambda i: (-cached[i], i))
+        if order == slots:
+            return
+        reordered = list(head)
+        for slot, source in zip(slots, order):
+            reordered[slot] = head[source]
+        # Dropping the window in one pass avoids quadratic per-request removal.
+        self.waiting.remove_requests(head)
+        for request in reversed(reordered):
+            self.waiting.prepend_request(request)
+
+    def _touch_waiting_prefixes(self) -> None:
+        """Bump LRU recency of the waiting requests' resident prefix blocks.
+
+        Port of sgl-project/sglang#41593. Prefix lookup happens only at
+        admission, so a queued request's cached blocks age in the free queue
+        like any other. At most once per interval, the resident blocks of the
+        first waiting requests move to the MRU end: queue head last and, within
+        a request, the first block last, because a prefix is unusable past its
+        first evicted block. Only the order changes; no reference is taken.
+        """
+        now = time.monotonic()
+        if now - self._last_waiting_prefix_refresh < _WAITING_PREFIX_REFRESH_INTERVAL_S:
+            return
+        self._last_waiting_prefix_refresh = now
+        kv_cache_manager = self.kv_cache_manager
+        free_block_queue = kv_cache_manager.block_pool.free_block_queue
+        head = itertools.islice(
+            itertools.chain(self.skipped_waiting, self.waiting),
+            _WAITING_PREFIX_REFRESH_MAX,
+        )
+        for request in reversed(list(head)):
+            if not kv_cache_manager.prefix_cache_lookup_enabled(request):
+                continue
+            hit_blocks, num_hit_tokens, _ = (
+                kv_cache_manager.coordinator.find_longest_cache_hit(
+                    request.block_hashes, request.num_tokens - 1
+                )
+            )
+            blocks = []
+            if isinstance(kv_cache_manager, RBLNKVCacheManager):
+                blocks.extend(
+                    kv_cache_manager.sub_block_source_blocks(request, num_hit_tokens)
+                )
+            for group_blocks in hit_blocks:
+                blocks.extend(reversed(group_blocks))
+            for block in blocks:
+                if block.ref_cnt == 0 and not block.is_null:
+                    free_block_queue.remove(block)
+                    free_block_queue.append(block)
 
 
 class RBLNAsyncScheduler(RBLNScheduler, AsyncScheduler):
